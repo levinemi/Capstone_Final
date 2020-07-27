@@ -1,6 +1,6 @@
 Rfiles:
 1) Yelp Project v6.Rmd - RMarkdown file with code as of July 27, 2020
-2) Yelp Project-v4.Rmd - Word document with code as of July 7, 2020
+2) M Levine - Final Report - RMarkdown Output.docx - RMarkdown Output as of July 27, 2020
 
 Data Files required for the project:
 1) business.RData --> R file of all the YELP businesses
@@ -12,10 +12,10 @@ Data Files required for the project:
 
 
 Instructions:
-1) Download "Yelp Project v4.Rmd" and store in folder called Yelp.
+1) Download "Yelp Project v6.Rmd" and store in folder called Yelp.
 2) Download each data file. Unzip the business and reviews_sample files and store them in a folder called Data in the Yelp folder.
 2) Set the working directory in the RMD file to Yelp folder.
-3) Run or knit the script "Yelp Project v4.Rmd" in RStudio. (It takes approximately 20 min to run the whole script)
+3) Run or knit the script "Yelp Project v6.Rmd" in RStudio. (It takes approximately 20 min to run the whole script)
 
 GitHub Link: https://github.com/levinemi/Capstone_Final
 
