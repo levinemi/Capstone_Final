@@ -1,0 +1,1674 @@
+---
+title: "Yelp Project"
+author: "levinemi"
+date: "14/05/2020"
+output:
+  word_document: default
+  pdf_document: default
+  html_document: default
+---
+
+##Where should we take the kids? An analysis of family-friendly businesses in the Yelp dataset
+The amount of time that parents devote to their children has been increasing steadily since the 1990s. The amount of money parents spend on their children has also increased by more than 50% from 1972 to 2007. So, targeting families could be a good strategy to woo customers. Identifying what makes a business family-friendly may help attract families to a new business or guide improvements to an established business. Yelp makes a dataset of crowd-sourced reviews about businesses available for educational and academic purposes. The dataset includes information about more than 200,000 businesses worldwide, including business type, location and amenities as well as customer reviews.  The proposed project is an exploratory analysis of businesses that market themselves as family-friendly. Using machine learning, I aim to identify common features, explore customer sentiment and predict business ratings.  
+
+#Load Packages 
+```{r, results='hide', message=FALSE, warning=FALSE}
+library(arules) #this will mask recode from dplyr so need to load before dplyr
+library(arulesViz)
+library(tidytext)
+library(tidyr)
+library(widyr)
+library(purrr)
+library(stringr)
+library(ggplot2)
+library(igraph)
+library(ggraph)
+library(topicmodels)
+library(SnowballC)
+library(summarytools)
+library(caret)
+library(gmodels)
+library(FSelector)
+library(leaps)
+library(RColorBrewer)
+library(data.table)
+library(textdata)
+library(textstem)
+library(PMCMR)
+library(sentimentr)
+#library(tm) to be loaded later so as not to interact with arules package.
+library(wordcloud)
+library(reshape2)
+library(mice)
+library(VIM)
+library(corrplot)
+#library(car) to be loaded later so as not to interact with arules package
+library(ROCit)
+library(partykit)
+library(plyr);library(dplyr)
+```
+
+#Load Business Dataset
+
+Set the working directory for the script.
+```{r}
+setwd("~/YELP")
+```
+
+The data about Yelp Businesses was originally loaded from a json file and then was exported to an .Rdata format to make future data loads faster.
+```{r}
+#Load and flatten 'businesses' collection
+
+#business_raw <- stream_in(file("yelp_academic_dataset_business.json"))
+#business_flat <- flatten(business_raw, recursive = T)
+
+#export the business_flat collection to .Rdata
+#save(business_flat, file = "business.RData")
+```
+
+Load the Yelp business data file from the .Rdata file.
+```{r}
+business_df <- load("Data/business.RData")
+business_df <- as.data.frame(business_flat)
+rm(business_flat)
+```
+
+Create a subset of the data focused on businesses that have the flag "good_for_kids". 
+```{r}
+#Frenquency table for "good for kids" attributes, which shows all possible values and counts for each value.
+summarytools::freq(business_df$attributes.GoodForKids)
+
+#Filter the business dataset for businesses with the attribute "good for kids"
+business_subset <- business_df %>% 
+  filter(attributes.GoodForKids == "True")
+```
+
+# Exploratory Analysis of Businesses that are "good for kids". 
+*What are the characteristics of the "good for kids" businesses?*
+*Location:*
+```{r}
+#Number of cities
+business_subset %>% 
+  distinct(city) %>% 
+  count()
+
+#Number of states or provinces
+business_subset %>% 
+  distinct(state) %>% 
+  count()
+
+summarytools::freq(business_subset$state, order = "freq")
+```
+```{r, echo=FALSE}
+#Location (city and state)
+business_subset %>% 
+  count(city, state, sort = T) %>% 
+  top_n(10,n) %>%
+  arrange(n)%>% 
+  mutate(city = factor(city, levels=city)) %>% 
+  ggplot(aes(x=city, y=n, fill=city, label = n))+
+  geom_col(fill = "#366091", show.legend = F)+
+  geom_text(size=4, 
+            position = position_stack(vjust = 0.5), 
+            color = "whitesmoke")+
+  ylab("Count")+
+  xlab("City")+
+  theme(axis.text = element_text(size=11))+
+  coord_flip()
+```
+
+*Stars:*
+```{r}
+#Stars needs to be converted to a factor
+business_subset$stars <- as.factor(business_subset$stars)
+
+#Number of businesses with NA for stars
+sum(is.na(business_subset$stars))
+```
+```{r, echo=FALSE}
+#histogram of stars
+business_subset %>% 
+  count(stars) %>% 
+  ggplot(aes(x=stars, y=n, fill=n, group = n))+
+  geom_col(fill = "#366091", show.legend = F)+
+  geom_text(aes(x=stars, y=n, label=n, group = n), 
+            position = position_dodge(width = 1), 
+            vjust = -0.4, size = 4)+
+  xlab("Stars")+
+  ylab("Count of Businesses")+
+  theme(axis.text = element_text(size=11))
+
+#geom_text(size=5, position = position_stack(vjust = 1.05))
+```
+
+*Reviews:*
+```{r}
+#Number of reviews
+business_subset %>% 
+  count(review_count) %>% 
+  summarise(sum(review_count*n))
+
+#average number of reviews per business
+business_subset %>% 
+  summarise(round(mean(review_count),2))
+
+#distribution of number of reviews
+summary(business_subset$review_count)
+```
+```{r, echo=FALSE}
+boxplot(business_subset$review_count, pch=19, col= "#366091", xlab="Review Count", ylab = "Count")
+boxplot(business_subset$review_count, pch=19, log='y', col= "#366091", xlab="Review Count", ylab="Log of review_count")
+```
+```{r}
+#number of outliers
+length(boxplot.stats(business_subset$review_count)$out)
+```
+The outliers will be addressed prior to the sentiment analysis
+
+*Open:*
+```{r}
+#Is open
+summarytools::freq(business_subset$is_open)
+```
+
+# Exploratory Analysis of Categories & Names
+
+Using the business categories and business names, *what can we learn about the businesses that are "good for kids"? *
+
+Start by creating separate dataframes for the business names and the business categories. The business_id ("ID") is retained in each dataframe as a primary key to link back to the complete business_subset.
+```{r}
+name_df <- tibble(business_subset$business_id, business_subset$name)
+colnames(name_df) <- c("ID", "name")
+  
+category_df <- tibble(business_subset$business_id, business_subset$categories)
+colnames(category_df) <- c("ID", "categories")
+
+#normalize the text to lowercase
+name_df$Name <- tolower(name_df$name)
+category_df$categories <- tolower(category_df$categories)
+```
+
+The category attribute contains a string with one or more categories. Each category is separated by a comma. To create a tidy dataframe, I split the category attribute at the comma to create a new dataframe with one category and business_id per row. Businesses with multiple categories appear in multiple rows.
+```{r}
+#unnest the category tokens by dividing the list for each business at the comma
+full_category_df <- category_df %>% 
+  unnest_tokens(category, categories, token = "regex",
+                pattern = ", ") %>% 
+  ungroup()
+
+full_category_df
+```
+
+*How many different categories are there in the list of "good for kids" businesses?*
+Yelp organizes their categories as heirarchy with categories and subcategories. 
+```{r}
+#total number of categories and subcategories
+full_category_df %>% 
+  summarise(n_distinct(category))
+
+#count by category name
+full_category_df %>% 
+  count(category, sort = T)
+
+```
+The 928 values is the total number of both categories and subcategories.  I renamed the category attribute as subcategory as it contains both category and subcategory values. And I created a new category attribute by converting each subcategory value to its parent category.
+
+```{r}
+#import Yelp category list from:https://www.yelp.com/developers/documentation/v3/category_list
+yelp_cat <- read.csv("Data/Yelp_Categories.csv", header = T)
+
+#normalize subcategories/categories to lowercase to match with full_category_df
+yelp_cat$category <- tolower(yelp_cat$category)
+yelp_cat$subcategory <- tolower(yelp_cat$subcategory)
+
+#combine tokenized category list (full_category_df) with the Yelp categories 
+full_category_df <- full_category_df %>% 
+  left_join(yelp_cat, by = c("category"="subcategory")) %>% 
+  rename(yelp_category=category.y) %>% 
+  rename(yelp_subcategory=category)
+
+#create a list of categories
+yelp_cat_list <- full_category_df %>% 
+  distinct(yelp_category) %>% 
+  filter(!is.na(yelp_category))
+
+yelp_cat_list <- as.character(yelp_cat_list$yelp_category)
+
+#The total number of categories
+full_category_df %>% 
+  summarise(n_distinct(yelp_category, na.rm = T))
+
+#The total number of subcategories
+full_category_df %>% 
+  filter(!yelp_subcategory %in% yelp_cat_list) %>% 
+  summarise(n_distinct(yelp_subcategory, na.rm = T))
+```
+There are 22 categories and 906 subcategories in the whole dataset. 
+
+When I created the category attribute, some records got an NA value. This occurred for records with a subcategory value that are no longer listed on yelp's business list. The records with NA values for category will be excluded from analysis involving the category attribute.
+```{r}
+#what percent of records have NA value for yelp_category?
+round(sum(is.na(full_category_df$yelp_category))/nrow(full_category_df)*100,1)
+
+#what percent of records have NA value for subcategory?
+round(sum(is.na(full_category_df$yelp_subcategory))/nrow(full_category_df)*100,1)
+```
+
+*How many categories are listed for each business?*
+```{r, message=FALSE}
+#the number of distinct yelp (high level) categories per business
+full_category_df %>% 
+  filter(!is.na(yelp_category)) %>%
+  group_by(ID) %>% 
+  summarise(n=n_distinct(yelp_category)) %>% 
+  summarytools::freq(n)
+  
+```
+Most businesses list between 1 and 3 categories and more than 98% of businesses listed between 1 and 3 categories. 
+
+*How many businesses per category?*
+```{r, message=FALSE}
+j <- full_category_df %>% 
+   filter(!is.na(yelp_category)) %>%
+   group_by(yelp_category) %>% 
+   summarise(n=n_distinct(ID)) %>% 
+   summarise(sum(n))#total number of categories selected by businesses
+
+k <- full_category_df %>% 
+  filter(!is.na(yelp_category)) %>%
+  group_by(yelp_category) %>% 
+  summarise(n=n_distinct(ID)) %>% 
+  arrange(desc(n)) 
+
+k #The number of businesses per category
+
+# The percent of category selections that were restaurants
+round((k$n[k$yelp_category=="restaurants"]/j)*100,1) 
+
+rm(j)
+```
+Note: there is double counting of businesses as they can select more than 1 category.
+
+```{r, echo=FALSE}
+k %>% 
+  ggplot(aes(reorder(yelp_category,n), n))+
+  geom_col(fill = "#366091", show.legend = F)+
+  xlab("Yelp Categories")+
+  ylab("Number of Businesses")+
+  theme(axis.text = element_text(size=11))+
+  coord_flip()
+```
+
+*What are the top 10 subcategories for good for kid businesses?*
+```{r, echo=FALSE, message=FALSE}
+full_category_df %>% 
+  filter(!yelp_subcategory %in% yelp_cat_list) %>% #excluding the category values from the subcategory attribute as they are combined
+  group_by(yelp_subcategory) %>% 
+  summarise(n=n_distinct(ID)) %>% 
+  arrange(desc(n)) %>% #the number of businesses per (high level) categories per business
+  top_n(10,n) %>% 
+  ggplot(aes(reorder(yelp_subcategory,n), n))+
+  geom_col(fill = "#366091", show.legend = F)+
+  xlab("Yelp Subcategories")+
+  ylab("Number of Businesses")+
+  theme(axis.text = element_text(size=11))+
+  coord_flip()
+```
+
+Note: there are 171 businesses that have only categories and no subcategories. That is why there are fewer total records in the subcategory plot compared to the category plot. 
+
+# Refine the question based on findings
+
+The most common categories and subcategories selected in this dataset relate to restaurants. The remaining analsyis will focus on those restaurants that are family friendly (ff = food focused).
+
+The revised guiding questions for the project and methods for answering them are: 
+1) What are the characteristics of family-friendly restaurants? 
+--Explore subcategory frequencies and correlations
+--Analysis of word-pairs in the titles
+--Latent Dirichlet Allocation
+
+2) Are there combinations of business features related to good reviews? 
+--Dimentionality Reduction, including a comparison of feature selection techniques
+--Association rules Analysis
+
+3)What matters most to customers that are satisfied or dissatisfied with their experience? 
+--Sentiment Analysis
+--Classification model for stars rating using review sentiment and association rules analyses
+
+-- 
+# Create list of family-friendly restaurants (ff) and their categories/subcategories
+```{r}
+ff_cat_df <- full_category_df %>% 
+  filter(yelp_category == "restaurants") 
+
+head(ff_cat_df)
+
+ff_cat_df %>% 
+  summarise(n=n_distinct(ID)) #total number of food focused businesses
+```
+
+Create subset of restaurants including all the characteristics
+```{r}
+ff_restaurants_df <- full_category_df %>% 
+  filter(yelp_category == "restaurants") 
+
+ff_restaurants_df <- ff_restaurants_df %>% 
+  select(-c(yelp_subcategory,yelp_category)) %>% 
+  left_join(business_subset, by = c("ID"="business_id")) %>% 
+  distinct(ID, .keep_all = T)
+
+ff_restaurants_df
+```
+
+Exploratory analysis of restaurant characteristics
+*What are the characteristics of the "good for kids" restaurants?*
+*Location:*
+```{r}
+#Number of cities
+ff_restaurants_df %>% 
+  distinct(city) %>% 
+  count()
+
+#Number of states or provinces
+ff_restaurants_df %>% 
+  distinct(state) %>% 
+  count()
+
+summarytools::freq(ff_restaurants_df$state, order = "freq")
+```
+```{r, echo=FALSE}
+#Location (city and state)
+ff_restaurants_df %>% 
+  count(city, state, sort = T) %>% 
+  top_n(10,n) %>%
+  arrange(n)%>% 
+  mutate(city = factor(city, levels=city)) %>% 
+  ggplot(aes(x=city, y=n, fill=city, label = n))+
+  geom_col(fill = "#366091", show.legend = F)+
+  geom_text(size=4, 
+            position = position_stack(vjust = 0.5), 
+            color = "whitesmoke")+
+  ylab("Count")+
+  xlab("City")+
+  theme(axis.text = element_text(size=11))+
+  coord_flip()
+```
+
+*Stars:*
+```{r, echo=FALSE}
+#histogram of stars
+ff_restaurants_df %>% 
+  count(stars) %>% 
+  ggplot(aes(x=stars, y=n, fill=n, group = n))+
+  geom_col(fill = "#366091", show.legend = F)+
+  geom_text(aes(x=stars, y=n, label=n, group = n), 
+            position = position_dodge(width = 1), 
+            vjust = -0.4, size = 4)+
+  xlab("Stars")+
+  ylab("Count of Businesses")+
+  theme(axis.text = element_text(size=11))
+
+```
+
+*Reviews:*
+```{r}
+#Number of reviews
+ff_restaurants_df %>% 
+  count(review_count) %>% 
+  summarise(sum(review_count*n))
+
+#average number of reviews per business
+ff_restaurants_df %>% 
+  summarise(round(mean(review_count),2))
+
+#distribution of number of reviews
+summary(ff_restaurants_df$review_count)
+```
+```{r, echo=FALSE}
+boxplot(ff_restaurants_df$review_count, pch=19, col= "#366091", xlab="Review Count", ylab = "Count")
+boxplot(ff_restaurants_df$review_count, pch=19, log='y', col= "#366091", xlab="Review Count", ylab="Log of review_count")
+```
+```{r}
+#number of outliers
+length(boxplot.stats(ff_restaurants_df$review_count)$out)
+```
+The outliers will be addressed prior to the sentiment analysis
+
+*Open:*
+```{r}
+#Is open
+summarytools::freq(ff_restaurants_df$is_open)
+```
+
+
+To understand restaurant types that are family friendly, I looked first at the subcategories which provide details about type of food (e.g., pizza, tacos) and cuisine (e.g., mexican, japanese). I started by exploring *what are the most common subcategories combinations for restaurants?*
+```{r, message=FALSE, warning=FALSE}
+ff_cat_df %>% 
+  filter(!yelp_subcategory %in% yelp_cat_list) %>% #excluding the category values from the subcategory attribute as they are combined
+  group_by(yelp_subcategory) %>% 
+  summarise(n=n_distinct(ID)) %>% arrange(desc(n)) %>% top_n(10,n)
+
+#count the number of times each pair of items appear together within a business.
+ff_cat_df %>% 
+  filter(!yelp_subcategory %in% yelp_cat_list) %>% 
+  pairwise_count(yelp_subcategory, ID, sort=T)
+
+#phi coefficient showing how often they appear in the same business
+category_correlations <- ff_cat_df %>% 
+  filter(!yelp_subcategory %in% yelp_cat_list) %>% 
+  group_by(yelp_subcategory) %>%
+  filter(n()>=100) %>% 
+  pairwise_cor(yelp_subcategory, ID, sort = T)
+
+category_correlations
+```
+```{r, message=FALSE, echo=FALSE}
+#graph the words that are most correlated with the top 5 high level categories
+category_correlations %>% 
+  filter(item1 %in% c("fast food", "sandwiches", "pizza", "breakfast & brunch", "burgers", "mexican")) %>% 
+  group_by(item1) %>% 
+  top_n(5) %>% 
+  ungroup() %>% 
+  mutate(item2 = reorder(item2, correlation)) %>% 
+  ggplot(aes(x=item2, y=correlation, fill=item1))+
+  geom_bar(stat = "identity", show.legend = F)+
+  scale_fill_brewer(type = "qual", palette = 1)+
+  labs(y = "Phi Correlation Coefficient", x="")+
+  facet_wrap(~ item1, ncol=2, scales = "free_y")+
+  theme(strip.text = element_text(size=12), axis.text = element_text(size=11))+
+  coord_flip()
+
+```
+
+*Can restaurant names identify popular types of restaurants?*
+Unlike the categories, restuarant titles are free text fields. The restaurant titles need to be cleaned and normalized by, for example, removing punctuation, stopwords, infrequent- and frequent-words  and lemmatizing words. 
+```{r, message=FALSE}
+#Create a dataframe for analysing the title
+business_title <- left_join(ff_cat_df, name_df, by = c("ID"="ID"))
+business_title <- tibble(ID = business_title$ID, title = business_title$name)
+
+#Create a dataframe of stop words from english, french and spanish using the snowball lexicon from tidytext (Which is available in multiple langauges)
+custom_stop_words <- get_stopwords(language = "en", source = "snowball")
+custom_stop_words <- rbind(custom_stop_words, get_stopwords(language = "fr", source = "snowball"))
+custom_stop_words <- rbind(custom_stop_words, get_stopwords(language = "es", source = "snowball"))
+
+#Remove stop words from the business titles
+business_title <- business_title %>% 
+  unnest_tokens(word, title) %>% #strips punctuation
+  anti_join(custom_stop_words) %>% #removes stopwords
+  mutate(word = lemmatize_words(word)) #convert text using lemmatize
+
+#Remove words that are digits
+k <- which(str_detect(business_title$word, "\\d+"))
+business_title <- business_title[-k,]
+
+#Remove words that are 2 characters or shorter
+k <- which(nchar(business_title$word)<=2)
+business_title <- business_title[-k,]
+
+#What are the 10 most common words in the title 
+business_title %>% 
+  count(word, sort = T) %>% 
+  top_n(10)
+
+pop_unpopular <- rbind(business_title %>% count(word, sort = T) %>% top_n(1) %>% select(word), 
+                       business_title %>% count(word, sort = T) %>% top_n(-10) %>% select(word)) #least popular words in the title
+
+#remove the word restaurant which is the most popular word and is the category for all records as well as the 630 words that only appear once in the dataset
+business_title <- business_title %>% 
+  anti_join(pop_unpopular) 
+```
+The most common words in the restaurant titles are similar to the most common YELP subcategories.
+
+*How many times does each pair of words occur in a title *
+```{r}
+title_word_pairs <- business_title %>% 
+  pairwise_count(word, ID, sort=T, upper = F) #count the frequency of words pairs
+
+title_word_pairs
+```
+It's difficult to see patterns in the word pairs from counts alone. So I created a network diagram to show the most common word pairs. Note: pairs must appear at least 100 times in the dataset to be included in the diagram.
+```{r, echo=FALSE}
+set.seed(7912)
+
+title_word_pairs %>% 
+  filter (n>=75) %>% 
+  graph_from_data_frame() %>% 
+  ggraph(layout = "fr")+
+  geom_edge_link(aes(edge_alpha = n, edge_width = n), edge_colour = "#366091") +
+  geom_node_point(size = 3) +
+  geom_node_text(aes(label = name), repel = TRUE, 
+                 point.padding = unit(0.2, "lines")) +
+  theme_void()
+```
+
+The diagram highlights common words as nodes (e.g., grill, pizza, cuisine).
+
+The diagram  also highlights that the most common word pairs are names of fastfood chains (e.g., dairy queen, pizza hut, burger king, panera bread)) or common food pairings (e.g., fish and chip, bakery and cafe).
+
+The terms "grill" and "bar" seems to be popular for may type of food (e.g., rotisserie, sushi, mexican) or ambiance (e.g., sport).   
+# Latent Dirichlet Allocation
+
+The next step is to explore the restaurant titles to try and find common topics using Latent Dirichlet Allocation (LDA). LDA is a probabilistic modelling approach, to discover themes in the business names.
+
+Start by setting up the Gibbs Sampling
+```{r}
+#set parameters for Gibbs sampling
+burnin <-4000
+iter <- 2000
+thin <-500
+seed <- list(6, 8, 110, 3800, 13000)
+nstart <-5
+best <- TRUE
+```
+
+Set the number of topics (k)
+```{r}
+#Set the number of topics
+k <- 5
+```
+```{r}
+businesstitle_counts <- business_title%>% 
+  count(ID, word, sort = T) %>% 
+  ungroup()
+
+businesstitle_dtm <- businesstitle_counts %>% 
+  cast_dtm(ID, word, n) #cast to a document term matrix
+```
+```{r}
+#LDA analysis using Gibbs sampling
+businesstitle_lda <- LDA(businesstitle_dtm, k = k, method="Gibbs", control = list(nstart=nstart, seed=seed, best=best, burnin = burnin, iter = iter, thin=thin))
+```
+
+Beta is a metric output from the LDA. It is the probability of each term being generated from each topic
+```{r}
+tidy_beta <-tidy(businesstitle_lda, matrix = "beta")
+tidy_beta
+```
+
+The visualition below shows the most common words per topic.  
+```{r}
+top_terms <- tidy_beta %>% 
+  group_by(topic) %>% 
+  top_n(5, beta) %>% 
+  ungroup() %>% 
+  arrange(topic, -beta)
+
+#visualize the terms
+top_terms %>%
+  mutate(term = reorder_within(term, beta, topic)) %>%
+  group_by(topic, term) %>%    
+  arrange(desc(beta)) %>%  
+  ungroup() %>%
+  ggplot(aes(term, beta, fill = as.factor(topic))) +
+  geom_col(show.legend = FALSE) +
+  scale_fill_brewer(type = "qual", palette = 3)+
+  coord_flip() +
+  scale_x_reordered() +
+  labs(title = "Top 5 terms in each LDA topic",
+       x = NULL, y = expression(beta)) +
+  facet_wrap(~ topic, ncol = 2, scales = "free_y")
+
+```
+
+Overall the probabilities of each term per topic are quite low, less than 15%. The LDA reveals some topics that are similar to those identified by the categories.  Topic 3 seems to relate to fast food pizza and topic 4 seems to relate to japanese restaurants.  But both topics also include words that seem unrelated to the topic (e.g., noodle and subway, respectively). For the other 3 topics, the beta values are all less than 10% and the terms 
+terms don't seem to hang together well. 
+
+An alternative analysis for beta is to look at the spread of terms. That is to see the terms that have the greatest difference between two topics. In the example below, we explore the difference between topic 1 and 2.
+```{r}
+beta_spread <- tidy_beta %>% 
+  mutate(topic = paste0("topic", topic)) %>% 
+  spread(topic, beta) %>% 
+  filter(topic1 > .001| topic2 > .001) %>% 
+  mutate(log_ratio = log2(topic2 / topic1))
+
+beta_spread
+
+#visualise the terms with the biggest spread
+biggest_spread <- beta_spread %>% 
+  select(term, log_ratio) %>% 
+  top_n(10,abs(log_ratio)) %>%
+  arrange(-log_ratio)
+  
+biggest_spread %>% 
+  mutate(term = reorder(term, log_ratio)) %>% 
+  ggplot(aes(term, log_ratio, fill=log_ratio))+
+  geom_bar(stat="identity")+
+  xlab("Term")+
+  ylab("Log2 ratio of beta in topic 1 / topic 2")+
+  coord_flip()
+  
+
+```
+
+This analysis doesn't provide much additional information. This could be because the topics themselves aren't well defined or it could be because there are few words per restaurant name.
+
+Gamma is another metric output by LDA. It is the per-restaurant-per-topic probabilities.  Gamma is useful for seeing how well the LDA identifies a topic for each restaurant.
+```{r}
+#create a gamma tibble
+tidy_gamma <-tidy(businesstitle_lda, matrix = "gamma")
+tidy_gamma
+```
+
+We can explore the relative importance of the assigned topic (e.g., topic with the maximum gamma probability) and the next highest topic probability for each restaurant.  If the relative importance of the assigned topic is high, that means that the topics effectively differentiate the restaurants. If the relative importance is close to 1, that means that the probability of a restaurant being assigned to the two topics is similar.  
+```{r}
+gamma_spread <- tidy_gamma %>% 
+  group_by(document) %>% 
+  arrange(document, -gamma) %>% 
+  mutate(gamma_rank = rank(-gamma, ties.method = "random")) %>% 
+  filter(gamma_rank == 1|gamma_rank == 2) %>% 
+  arrange(document, gamma_rank) %>%
+  mutate(topic = rep(c("TopTopic", "NextTopic"))) %>% 
+  select(-gamma_rank) %>% 
+  spread(topic, gamma) %>% 
+  mutate(relative_importance = TopTopic/NextTopic)
+
+summarytools::freq(round(gamma_spread$relative_importance,1))
+
+```
+
+*Summary of LDA Analysis*
+
+I tested k values between 5 and 20. In all cases, the LDA topics developed from the business names were not clear or useful. The term per topic probabilities (beta) did not create meaningful topics based on the terms. The restaurant per topic probabilities (gamma) also did not show distinct, meaningful topics. Moreover, for all values of k nearly 25% of restaurants were equally likely to be assigned to more than 1 topic.  
+
+Topic modelling using LDA does not result in additional information for the exploratory analysis. No clear topics can be identified by business name. The self-identified categories are a more useful way of grouping the than the topics created through LDA. 
+
+# Feature selection
+
+The next step in the analysis is to explore common business features/attributes among family-friendly restaurants with high star ratings. Using association analysis, I looked for sets of items that often occur together in highly rated restaurants. 
+In the YELP dataset the business features/attributes are a series of binary attributes where true means present, false means absent and NA indicates the information was not provided. There are 54 total attributes relevant to family-friendly restaurants. Many attributes have high numbers of NA values. I used dimensionality reduction to find the best features to include in the association analysis
+
+*Data Cleaning*
+
+Start by creating a dataframe for the attributes and star ratings for family-friendly restaurants. 
+```{r}
+ff_subset <- ff_cat_df %>% 
+  select(ID) %>% 
+  distinct(ID) %>% 
+  left_join(business_subset, by = c("ID"="business_id"))
+
+ff_assoc <- ff_subset %>% 
+  select("ID", "stars", starts_with("attributes."))
+```
+
+Next, I cleaned the attribute data. For example, BusinessParking, Ambiance and GoodForMeal attributes are arrays. They need to be unnested.
+```{r, message=FALSE, warning=FALSE}
+#Create a dataframe for  the column that needs to be split + ID (attributes.Ambience)
+k<- ff_assoc %>% 
+  select(ID, attributes.Ambience) 
+
+#split the string at the column and seperate each key value pair onto a seperate row with the appropriate business ID
+k<- k %>% 
+  mutate(attributes.Ambience = strsplit(attributes.Ambience, ",")) %>% 
+  unnest(attributes.Ambience)
+
+#clean up the text by removing extra characters and whitespace
+k$attributes.Ambience<- str_replace_all(k$attributes.Ambience,"\\{","")
+k$attributes.Ambience<- str_replace_all(k$attributes.Ambience,"\\'","")
+k$attributes.Ambience<- str_replace_all(k$attributes.Ambience,"\\}","")
+k$attributes.Ambience<- trimws(k$attributes.Ambience)
+
+# shift the keys to the columns and the values to the cells and rename the attributes
+k <- k %>% separate(attributes.Ambience, c("key1","value"), sep = ": ", extra = "warn", fill = "warn") %>% 
+  spread(key1,value) %>% 
+  select(-c(V1, `<NA>`, None)) %>% 
+  rename_at(vars(-ID), ~ paste0('Ambience.',.))
+
+#reconnect the dataframe to the ff_association rules
+ff_assoc <- left_join(ff_assoc, k) %>% 
+  select(-c(attributes.Ambience))
+```
+
+Repeat the attribute splitting, cleaning and reconnecting for Business Parking, GoodForMeal, BestNights, Music
+```{r, message=FALSE, warning=FALSE}
+##2) Create a dataframe for just the column that needs to be split + ID (attributes.BusinessParking)
+k<- ff_assoc %>% 
+  select(ID, attributes.BusinessParking) 
+
+#split the string at the column and seperate each key value pair onto a seperate row with the appropriate business ID
+k<- k %>% 
+  mutate(attributes.BusinessParking = strsplit(attributes.BusinessParking, ",")) %>% 
+  unnest(attributes.BusinessParking)
+
+#clean up the text by removing extra characters and whitespace
+k$attributes.BusinessParking<- str_replace_all(k$attributes.BusinessParking,"\\{","")
+k$attributes.BusinessParking<- str_replace_all(k$attributes.BusinessParking,"\\'","")
+k$attributes.BusinessParking<- str_replace_all(k$attributes.BusinessParking,"\\}","")
+k$attributes.BusinessParking<- trimws(k$attributes.BusinessParking)
+
+# shift the keys to the columns and the values to the cells and rename the attributes
+k <- k %>% separate(attributes.BusinessParking, c("key1","value"), sep = ": ", extra = "warn", fill = "warn") %>% 
+  spread(key1,value) %>% 
+  select(-c(V1, `<NA>`, None))%>%
+  rename_at(vars(-ID), ~ paste0('BusinessParking.',.))
+
+#reconnect the dataframe to the ff_association rules
+ff_assoc <- left_join(ff_assoc, k) %>% 
+  select(-c(attributes.BusinessParking))
+
+##3) Create a dataframe for just the column that needs to be split + ID (attributes.GoodForMeal)
+k<- ff_assoc %>% 
+  select(ID, attributes.GoodForMeal) 
+
+#split the string at the column and seperate each key value pair onto a seperate row with the appropriate business ID
+k<- k %>% 
+  mutate(attributes.GoodForMeal = strsplit(attributes.GoodForMeal, ",")) %>% 
+  unnest(attributes.GoodForMeal)
+
+#clean up the text by removing extra characters and whitespace
+k$attributes.GoodForMeal<- str_replace_all(k$attributes.GoodForMeal,"\\{","")
+k$attributes.GoodForMeal<- str_replace_all(k$attributes.GoodForMeal,"\\'","")
+k$attributes.GoodForMeal<- str_replace_all(k$attributes.GoodForMeal,"\\}","")
+k$attributes.GoodForMeal<- trimws(k$attributes.GoodForMeal)
+
+# shift the keys to the columns and the values to the cells and rename the attributes
+k <- k %>% separate(attributes.GoodForMeal, c("key1","value"), sep = ": ", extra = "warn", fill = "warn") %>% 
+  spread(key1,value) %>% 
+  select(-c(V1, `<NA>`, None)) %>% 
+  rename_at(vars(-ID), ~ paste0('GoodForMeal.',.))
+
+#reconnect the dataframe to the ff_association rules
+ff_assoc <- left_join(ff_assoc, k) %>% 
+  select(-c(attributes.GoodForMeal))
+
+##4)Create a dataframe for just the column that needs to be split + ID (attributes.BestNights)
+k<- ff_assoc %>% 
+  select(ID, attributes.BestNights) 
+
+#split the string at the column and seperate each key value pair onto a seperate row with the appropriate business ID
+k<- k %>% 
+  mutate(attributes.BestNights = strsplit(attributes.BestNights, ",")) %>% 
+  unnest(attributes.BestNights)
+
+#clean up the text by removing extra characters and whitespace
+k$attributes.BestNights<- str_replace_all(k$attributes.BestNights,"\\{","")
+k$attributes.BestNights<- str_replace_all(k$attributes.BestNights,"\\'","")
+k$attributes.BestNights<- str_replace_all(k$attributes.BestNights,"\\}","")
+k$attributes.BestNights<- trimws(k$attributes.BestNights)
+
+# shift the keys to the columns and the values to the cells and rename the attributes
+k <- k %>% separate(attributes.BestNights, c("key1","value"), sep = ": ", extra = "warn", fill = "warn") %>% 
+  spread(key1,value) %>% 
+  select(-c(`<NA>`))%>%
+  rename_at(vars(-ID), ~ paste0('BestNights.',.))
+
+#reconnect the dataframe to the ff_association rules
+ff_assoc <- left_join(ff_assoc, k) %>% 
+  select(-c(attributes.BestNights))
+
+##5) Create a dataframe for just the column that needs to be split + ID (attributes.Music)
+k<- ff_assoc %>% 
+  select(ID, attributes.Music) 
+
+#split the string at the column and seperate each key value pair onto a seperate row with the appropriate business ID
+k<- k %>% 
+  mutate(attributes.Music = strsplit(attributes.Music, ",")) %>% 
+  unnest(attributes.Music)
+
+#clean up the text by removing extra characters and whitespace
+k$attributes.Music<- str_replace_all(k$attributes.Music,"\\{","")
+k$attributes.Music<- str_replace_all(k$attributes.Music,"\\'","")
+k$attributes.Music<- str_replace_all(k$attributes.Music,"\\}","")
+k$attributes.Music<- trimws(k$attributes.Music)
+
+# shift the keys to the columns and the values to the cells and rename the attributes
+k <- k %>% separate(attributes.Music, c("key1","value"), sep = ": ", extra = "warn", fill = "warn") %>% 
+  spread(key1,value) %>% 
+  select(-c(V1, `<NA>`, None))%>%
+  rename_at(vars(-ID), ~ paste0('Music.',.))
+
+#reconnect the dataframe to the ff_association rules
+ff_assoc <- left_join(ff_assoc, k) %>% 
+  select(-c(attributes.Music))
+
+rm(k)
+```
+
+Remove "attributes." from the column names.
+```{r}
+ff_assoc <- ff_assoc %>% 
+  rename_at(vars(starts_with("attributes.")), list(~str_replace(., "attributes.","")))
+```
+
+*Dimensionality Reduction*
+
+Remove business features with more than 30% of the values missing.
+```{r}
+#create a function to calculate the % of NA per column
+percent_na <- function(x){
+  round(sum(is.na(ff_assoc[,x]))/nrow(ff_assoc)*100,1)
+} 
+
+col_num <- c(1:ncol(ff_assoc))#vector of column numbers
+sum(lapply(col_num, percent_na)>30.0) #total number of columns above the threshold of 30% NA
+
+ff_assoc_trim <- ff_assoc %>% select(-c(which(lapply(col_num, percent_na)>30.0)))#create a new df trimmed of attributes with high NA values
+```
+The attribute that were removed due to high NA values where:
+```{r}
+k<-which((colnames(ff_assoc) %in% colnames(ff_assoc_trim))==FALSE)
+colnames(ff_assoc)[k]
+```
+
+Remove "Good for Kids" variables which has low variance (all values are 1).
+```{r}
+ff_assoc_trim <- ff_assoc_trim %>% select(-c("GoodForKids"))
+```
+
+*Additional Data Cleaning and Dummy Variable Preparation*
+
+Binary variables
+```{r}
+#replace the values "True" with "1" & "False" and "None" with "0"
+ff_assoc_trim <- data.frame(lapply(ff_assoc_trim, function(x){
+  gsub("True","1",x)
+}))
+
+ff_assoc_trim <- data.frame(lapply(ff_assoc_trim, function(x){
+  gsub("False","0",x)
+}))
+
+ff_assoc_trim <- data.frame(lapply(ff_assoc_trim, function(x){
+  gsub("None","0",x)
+}))
+```
+
+Categorical variables
+```{r}
+#Clean the text values as several have extra characters.
+#WiFi
+ff_assoc_trim$WiFi <- str_replace_all(ff_assoc_trim$WiFi,"u\\'","")
+ff_assoc_trim$WiFi <- str_replace_all(ff_assoc_trim$WiFi,"\\'","")
+ff_assoc_trim$WiFi <- gsub("0",NA,ff_assoc_trim$WiFi)
+
+#RestaurantsAttire
+ff_assoc_trim$RestaurantsAttire <- str_replace_all(ff_assoc_trim$RestaurantsAttire,"u\\'","")
+ff_assoc_trim$RestaurantsAttire <- str_replace_all(ff_assoc_trim$RestaurantsAttire,"\\'","")
+ff_assoc_trim$RestaurantsAttire <- gsub("0",NA,ff_assoc_trim$RestaurantsAttire)
+
+#NoiseLevel (quiet = 1, average = 2, loud = 3, very loud = 4)
+ff_assoc_trim$NoiseLevel <- str_replace_all(ff_assoc_trim$NoiseLevel,"^u","")
+ff_assoc_trim$NoiseLevel <- str_replace_all(ff_assoc_trim$NoiseLevel,"quiet","1")
+ff_assoc_trim$NoiseLevel <- str_replace_all(ff_assoc_trim$NoiseLevel,"average","2")
+ff_assoc_trim$NoiseLevel <- str_replace_all(ff_assoc_trim$NoiseLevel,"very_loud","4")
+ff_assoc_trim$NoiseLevel <- str_replace_all(ff_assoc_trim$NoiseLevel,"loud","3")
+ff_assoc_trim$NoiseLevel <- gsub("0",NA,ff_assoc_trim$NoiseLevel)
+
+#Alcohol
+ff_assoc_trim$Alcohol <- str_replace_all(ff_assoc_trim$Alcohol,"u\\'","")
+ff_assoc_trim$Alcohol <- str_replace_all(ff_assoc_trim$Alcohol,"\\'","")
+ff_assoc_trim$Alcohol <- gsub("0",NA,ff_assoc_trim$Alcohol)
+
+#RestaurantsPriceRange2
+ff_assoc_trim$RestaurantsPriceRange2 <- gsub("0",NA,ff_assoc_trim$RestaurantsPriceRange2)
+
+```
+
+Convert the ordinal and nominal variables variables to rank and dummy variables, respectively.
+```{r}
+#WiFi
+dmy <- dummyVars("~ WiFi", data = ff_assoc_trim)
+trsf <- data.frame(predict(dmy, ff_assoc_trim))
+ff_assoc_trim <- cbind(ff_assoc_trim, trsf)
+
+#RestaurantsAttire
+dmy <- dummyVars("~ RestaurantsAttire", data = ff_assoc_trim)
+trsf <- data.frame(predict(dmy, ff_assoc_trim))
+ff_assoc_trim <- cbind(ff_assoc_trim, trsf)
+
+#Alcohol
+dmy <- dummyVars("~ Alcohol", data = ff_assoc_trim)
+trsf <- data.frame(predict(dmy, ff_assoc_trim))
+ff_assoc_trim <- cbind(ff_assoc_trim, trsf)
+
+ff_assoc_trim <- ff_assoc_trim %>% 
+  select(-c("WiFi", "RestaurantsAttire","Alcohol"))
+
+#convert remaining variables to factor
+ff_assoc_trim$RestaurantsPriceRange2 <- as.factor(ff_assoc_trim$RestaurantsPriceRange2)
+
+ff_assoc_trim$NoiseLevel <- as.factor(ff_assoc_trim$NoiseLevel)
+```
+
+The star attribute is separated into 9 values (from 1 to 5). For the association rules analysis, I summarized the star attribute into 2 groups "3.5 or less" and "4 or more". I'm interested in identifying groups of features that are common to restaurants with 4 or more stars.  
+```{r}
+levels(ff_assoc_trim$stars)
+ff_assoc_trim$stars <- revalue(ff_assoc_trim$stars, c("1"="3.5 orless","1.5"="3.5 orless", "2"="3.5 orless", "2.5"="3.5 orless","3"="3.5 orless", "3.5"="3.5 orless", "4"="4 or more","4.5"= "4 or more", "5"="4 or more"))
+levels(ff_assoc_trim$stars)
+
+table(ff_assoc_trim$stars)
+```
+
+*Feature selection*
+
+Three different feature selection techniques were used to identify the attributes that are most relevant to my association rules analysis. Again, because I'm looking at features common to restaurants with 4 or more stars, stars is the dependent variable in each of the feature selection analyses.   
+
+Information Gain
+```{r}
+ff_assoc_ig <- information.gain(stars~., data = ff_assoc_trim[,-1])
+
+ff_assoc_ig %>% 
+  arrange(-attr_importance)
+
+````
+
+
+Chi-squared feature selection (for categorical variables)
+```{r}
+ff_assoc_chsq <- chi.squared(stars~., data = ff_assoc_trim[,-1])
+
+ff_assoc_chsq %>% 
+  arrange(-attr_importance)
+
+```
+
+Stepwise regression (suggests that 9 are best)
+```{r, warning=FALSE, message=FALSE}
+k <- ff_assoc_trim[,-1]
+assoc_subset <- regsubsets(stars~., data = k)
+assoc_subset_sum <- summary(assoc_subset)
+k<-assoc_subset_sum$which[9,]
+k[k==T]
+```
+
+When comparing the top 10 features across the three feature selection methods, 6 attributes were identified in all three (BusinessParking.street, NoiseLevel, Ambience.trendy, Ambience.classy, Ambience.casual, HasTV). And 3 attributes appeared in 2 of the 3 models (Ambience.hipster, BikeParking, Alcoholfull_bar).
+
+The association rules analysis will focus on the attributes that appeared in 2 or 3 of the feature selection methods. Attributes that were rated highly by only 1 model weren't included.
+```{r}
+#create a dataframe with the 9 attributes to be used in the association rules analysis
+ff_assoc_fs <- ff_assoc_trim[,c(2, 3, 6, 9, 12, 13, 15, 19, 23, 33)]
+
+#remove rows with all attributes, other than stars, having NA or 0
+sum(rowSums(is.na(ff_assoc_fs))==9) # number of rows with all NA values
+k <- which(rowSums(is.na(ff_assoc_fs))==9)
+ff_assoc_fs <- ff_assoc_fs[-k,]
+
+#change all the columns to factors
+ff_assoc_fs[1:ncol(ff_assoc_fs)] <- lapply(ff_assoc_fs[1:ncol(ff_assoc_fs)],factor)
+```
+
+```{r}
+#identify the number of features per restaurant
+k <- ff_assoc_fs %>% 
+  mutate(noise_present = if_else(is.na(NoiseLevel),0,1)) %>% 
+  select(-c(stars, NoiseLevel)) #creates a dataframe of only the features in binary format (0=absent; 1=present)
+k[1:ncol(k)] <- lapply(k[1:ncol(k)], as.character) #convert factors to characters
+k[1:ncol(k)] <- lapply(k[1:ncol(k)], as.numeric) #then convert to numeric (as you can't convert values directly from factor to numeric)
+
+j <- rowSums(k, na.rm = T) #total the number of present features per row
+table(j) #number of features per restaurant
+m <- which(j==0) #index restaurants that have no features present (either NA or 0 for all values)
+
+ff_assoc_fs <- ff_assoc_fs[-m,] #remove rows without any features present
+
+#repeat conversion from factor to numeric without the 2440 rows
+k <- ff_assoc_fs %>% 
+  mutate(noise_present = if_else(is.na(NoiseLevel),0,1)) %>% 
+  select(-c(stars, NoiseLevel))
+k[1:ncol(k)] <- lapply(k[1:ncol(k)], as.character)
+k[1:ncol(k)] <- lapply(k[1:ncol(k)], as.numeric)
+
+j<- as.data.frame(rowSums(k, na.rm = T)) %>% rename(n_attr='rowSums(k, na.rm = T)') 
+
+j %>% mutate(num_features = as.character(if_else(n_attr<7,
+                 if_else(n_attr<4,"1-3","4-6"),"7-9"))) %>%
+  ggplot(aes(x=num_features))+
+  geom_bar(aes(y = ((..count..)/sum(..count..)*100)), fill = "#366091", width = 0.5)+
+  xlab("Number of Features")+
+  ylab("Percent of Restaurants")+
+  theme(axis.text = element_text(size=11))
+
+ 
+```
+
+#Association Rule analysis
+```{r}
+
+#convert the dataframe to a transaction object
+ff_trans <- as(ff_assoc_fs, "transactions")
+summary(ff_trans)
+```
+The ambience, street parking and "has TV" attributes were most frequent.  
+
+```{r}
+#item frequncy plot of the top 20 items
+itemFrequencyPlot(ff_trans, topN=20, type = "relative",col=brewer.pal(12,'Paired'))
+
+```
+*Generating Rules*
+38.17% of restaurants in the dataset have 4 or more stars. So I will start the parameters with support (frequency of the occurance of the item in the dataset) at 0.35 and confidence (the percentage of features that appear with 4 or more stars) at 0.50.
+```{r}
+summarytools::freq(ff_assoc_fs$stars) #Frequency of the star ratings 
+
+#setting the RHS appearance to "stars >= 4"
+association_rules <- apriori(ff_trans, parameter = list(supp=0.05, conf=0.4), appearance = list(default="lhs", rhs="stars=4 or more")  )
+```
+
+I tested the following combinations for support and confidence. They produced the number of rules listed below. The very low values of both support and confidence required to generate rules, suggest that the rules generated may not be useful or interesting for real-world use. 
+
+Support (0.35) & Confidence (0.5) --> 0 Rules;
+Support (0.25) & Confidence (0.5) --> 0 Rules;
+Support (0.15) & Confidence (0.5) --> 0 Rules;
+Support (0.05) & Confidence (0.5) --> 40 Rules;
+Support (0.05) & Confidence (0.55) --> 5 Rule;
+Support (0.05) & Confidence (0.6) --> 0 Rules;
+Support (0.05) & Confidence (0.4) --> 295 Rules;
+
+Inspect Rules
+```{r}
+#length(association_rules)#total number of rules
+present_rules <- subset(association_rules, subset=lhs %pin% '=1') #reduces the rules to those that have at least one value present ("=1" on the left-hand-side)
+
+length(present_rules) #total number of rules that have at least one value present
+inspect(head(present_rules, 20))
+
+rules_by_confidence <- sort(present_rules, by = "confidence")
+inspect(head(rules_by_confidence, 5)) #top five rules (by confidence)
+```
+
+Subset Rules 
+```{r}
+subset_rules <- which(colSums(is.subset(present_rules, present_rules))>1)
+subset_present_rules <- present_rules[-subset_rules]
+length(subset_present_rules)
+inspect(subset_present_rules)
+```
+The features that are most commonly part of a multi-item set are Street Parking, Casual Ambience, Bike Parking and quiet noise level & TV. 
+
+The following plot shows the  confidence, support and lift for each association rule. The support is very low, less than 10% for most rules with confidence of between 45 and 55%.  The list for a few rules is greater than 1 indicating that for a few rules the combination of feature is more common than expected in restaurants with 4 or more stars.
+```{r}
+scatter_rules <- present_rules[quality(present_rules)$confidence>0.3]
+plot(scatter_rules)
+```
+
+Another way to visualize the rules is through a graph-based visualization where the features and rules are two types of vertices and item-sets as edges.  Arrows from an item to a rule represent the LHS of a rule and arrows from a rule to an item represent the RHS of the rule. All the rules point to stars=4 or more, as that is the RHS value for all the rules in the analysis. 
+```{r}
+set.seed(2020)
+top10_presrules <- head(present_rules, n=10, by = "confidence")
+plot(top10_presrules, method = "graph", engine = "htmlwidget")
+```
+
+
+#Load Yelp Reviews for Family Friendly Restaurants
+
+The Yelp reviews were converted from JSON to CSV using Apache Spark and Python and provided by the course supervisor. The full review csv was loaded to R, and the subset of reviews for family friendly restaurants was identified by joining the CSV to the family-friendly restauarant subset by business_ID.
+```{r}
+#load a csv file of the Yelp reviews
+#reviews_df <- fread("dataset_review.csv")
+```
+```{r}
+#Join the ff_subset of family friendly restaurant2 to the reviews_df by business_id
+#ff_reviews <- left_join(ff_subset, reviews_df[,c(1,7)], by = c("ID"="V1"))
+```
+
+The df that with family friendly restaurant information and their reviews was exported to .Rdata for future data loads.
+```{r}
+#remove extra attributes (e.g., address, latitude)
+#ff_reviews <- ff_reviews[,c(2,3,5,6,10:60)]
+#save(ff_reviews, file = "reviews.RData")
+```
+
+Load the combined business/review data file from the .Rdata file.
+```{r}
+#ff_reviews <- load("Data/reviews.RData")
+```
+
+There were more than 4 million reviews available for analysis.  A random sample of 25% of the records was selected for the analysis.
+```{r}
+#create a sample of restaurants for analysis
+#set.seed(6811)
+#sample_row <- sample(nrow(ff_reviews), floor(nrow(ff_reviews)*0.25))
+#reviews_sample <- ff_reviews[sample_row,]
+```
+
+The df of the random sample of family friendly restaurants & reviews was exported to .Rdata for future data loads.
+```{r}
+#export the sample of ff_reviews to .Rdata
+#save(reviews_sample, file = "reviews_sample.RData")
+```
+
+Load the sample review file from the .Rdata file.
+```{r}
+review_sample_ff <- load("Data/reviews_sample.RData")
+```
+
+Select the columns relevant for analysis of reviews and format as tidy text.
+```{r}
+
+reviews_sample[1:2,]
+
+tidy_review <- reviews_sample %>% 
+  select(ID, stars, V7) %>%
+  rename(text=V7) %>% 
+  group_by(ID) %>% 
+  mutate(review_num = row_number()) %>% 
+  ungroup()
+```
+
+*Exploration and preparation of reviews data*
+```{r}
+#Number of ff_restaurants represented in the sample
+reviews_sample %>% 
+  distinct(ID) %>% 
+  count()
+
+#df of review_counts
+r_count <- reviews_sample %>% 
+  select(ID, review_count) %>% 
+  distinct(ID, .keep_all=TRUE) 
+
+#average number of reviews per business in sample
+r_count %>% 
+  summarise(round(mean(review_count),2))
+
+#distribution of number of reviews
+summary(r_count$review_count)
+```
+
+There are 41253 restaurants included in reviews sample, which means 95% of the businesses in the family-friendly restaurant subset are represented in the reviews sample. The average number of reviews per restaurant (92.63) is higher than the median (33.00), suggesting that the sample continues to have outliers.  
+
+```{r, echo=FALSE}
+boxplot(r_count$review_count, pch=19, col= "#366091", xlab="Review Count", ylab = "Count")
+boxplot(r_count$review_count, pch=19, log='y', col= "#366091", xlab="Review Count", ylab="Log of review_count")
+```
+```{r}
+#number of outliers
+length(boxplot.stats(r_count$review_count)$out)
+```
+
+There are 4340 businesses with review counts that are higher than expected in the sample. That is more than 10% of the restaurants in the sample. And those restaurants had a total of 554,103 reviews, which made up more than half the review sample (55.8%). To prevent the reviews for these businesses from skewing the analysis, they will be removed.  
+
+```{r}
+reviews_out <- which(r_count$review_count %in% boxplot.stats(r_count$review_count)$out)
+reviews_out <- r_count$ID[reviews_out]
+
+reviews_clean<- tidy_review %>% 
+  filter(!ID %in% reviews_out)
+
+nrow(reviews_sample)-nrow(reviews_clean)#number of reviews in the sample for the outliers
+round(((nrow(reviews_sample)-nrow(reviews_clean))/nrow(reviews_sample)*100),2)#percent of reviews in the sample for the outliers
+
+```
+
+*Identify the reviews that mention children.*
+```{r}
+#Tokenize the reviews at the word level 
+tidy_review <- reviews_clean %>% 
+  unnest_tokens(word, text)
+```
+
+I created a custom lexicon of child related terms (e.g., kid, teen, baby, son, neice) to use to identify the reviews that mention children. Only reviews that mention children are included in this analysis.
+```{r}
+#Import custom lexicon with child related terms 
+kid_lexicon <- read.csv("Data/KidLexicon.csv", header = T)
+
+sum(tidy_review$word %in% kid_lexicon$Term) #55483 words that match the kid_lexicon
+
+kid_review_list <- tidy_review[which(tidy_review$word %in% kid_lexicon$Term),]%>% 
+  select(ID, review_num) %>% 
+  group_by(ID, review_num) %>% 
+  distinct() %>% 
+  mutate(uniqueID = paste0(ID,review_num))%>%
+  ungroup() %>% 
+  select(uniqueID)
+  
+#subset the data to include only the reviews that mention children.
+reviews_kids <- reviews_clean %>%
+  mutate(uniqueID = paste0(ID,review_num)) %>%
+  filter(uniqueID %in% kid_review_list$uniqueID) %>% 
+  select(-uniqueID) 
+
+nrow(reviews_kids)#number of reviews that mention kids
+round((nrow(reviews_kids)/nrow(reviews_clean)*100),2) #percent of the cleaned reviews that mention kids
+
+```
+
+14.76% of the reviews for the sample of family-friendly restaurants mention kids. These are the reviews that will be the focus of the analysis.
+
+# Sentiment Analysis
+```{r, message=FALSE}
+#create a tidy tibble with each word in each review on it's own row for bag of words analysis.
+tidy_reviews_kids<-reviews_kids %>% 
+  unnest_tokens(word, text)
+
+#remove words that are numbers
+k <- which(str_detect(tidy_reviews_kids$word, "\\d+"))
+tidy_reviews_kids <- tidy_reviews_kids[-k,]
+
+#remove words that are "-" or less than 2 charachters long
+tidy_reviews_kids <- tidy_reviews_kids %>% filter(!str_detect(word, "_+"))
+
+#Remove words that are 2 characters or shorter
+k <- which(nchar(tidy_reviews_kids$word)<=2)
+tidy_reviews_kids <- tidy_reviews_kids[-k,]
+
+#remove stop words
+tidy_reviews_kids <- tidy_reviews_kids %>% 
+  anti_join(custom_stop_words)
+
+#lemmatize
+tidy_reviews_kids <- tidy_reviews_kids %>% 
+  mutate(word = lemmatize_words(word))
+```
+```{r}
+#check the frequency of the words
+tidy_reviews_kids %>% count(word, sort = T)
+
+#top 10 words
+tidy_reviews_kids %>% count(word, sort = T) %>% top_n(10)
+tidy_reviews_kids %>% count(word, sort = T) %>% top_n(-10)
+
+unpopular <- bind_rows(tidy_reviews_kids %>% count(word, sort = T) %>% top_n(10) %>% select(word),tidy_reviews_kids %>% count(word, sort = T) %>% top_n(-10) %>% select(word)) #least popular words in the reviews
+
+#remove 27,869 words that only appear once in the dataset
+tidy_reviews_kids <- tidy_reviews_kids %>% 
+  anti_join(unpopular) 
+```
+
+*Comparing lexicons*
+
+First, I assess sentiment for reviews at the word level. I compared three lexicons: AFINN, NRC and Bing. 
+
+*Load the lexicons*
+AFINN is a general purpose lexicon
+```{r}
+afinn_lexicon <- lexicon_afinn()
+
+afinn_lexicon %>% count(value <0) #There are more negative than positive terms
+```
+
+NRC is a general purpose lexicon
+```{r}
+nrc_lexicon <- lexicon_nrc()
+
+nrc_lexicon %>% count(sentiment =="negative") #3324 negative
+nrc_lexicon %>% count(sentiment =="positive") #2312 positive (also more negative than positive terms)
+```
+
+Bing is a general purpose lexicon, and some have suggested that it is particularly good for social media (https://www.cs.uic.edu/~liub/FBS/sentiment-analysis.html)
+```{r}
+bing_lexicon <- get_sentiments("bing")
+
+bing_lexicon %>% count(sentiment =="negative") #more negative than positive
+
+```
+
+*Combine lexicons with reviews to calculate sentiment values*
+```{r, message=FALSE}
+afinn <- tidy_reviews_kids %>% 
+  inner_join(afinn_lexicon) %>% 
+  group_by(ID) %>% 
+  summarise(sentiment = sum(value)) %>% 
+  mutate(method = "AFINN")
+```
+```{r, message=FALSE}
+nrc <- tidy_reviews_kids %>% 
+  inner_join(nrc_lexicon) %>% 
+  group_by(ID) %>% 
+  count(sentiment)%>% 
+  spread(sentiment, n, fill = 0) %>% 
+  mutate(sentiment = positive - negative) %>% 
+  mutate(method = "NRC") %>% 
+  select(ID, negative, positive, sentiment, method)
+```
+```{r, message=FALSE}
+bing <- tidy_reviews_kids %>% 
+  inner_join(bing_lexicon) %>% 
+  group_by(ID) %>% 
+  count(sentiment) %>% 
+  spread(sentiment, n, fill = 0) %>% 
+  mutate(sentiment = positive - negative) %>% 
+  mutate(method = "Bing")
+```
+
+
+*Combine the three sentiment dataframes into one for comparison.*
+```{r}
+
+bind_rows(afinn, nrc, bing) %>% 
+  ggplot(aes(ID, sentiment, fill = method)) +
+  geom_col(show.legend = FALSE)+
+  facet_wrap(~method, ncol=1, scales="free_y")+
+  theme(axis.text.x = element_blank())
+
+```
+
+The Afinn sentiment scores are objectively higher than the Bing and NRC.  That's not unexpected as it was aggregated by adding up individual word sentiment from the likert score for each business. That differs from Bing and NRC which were aggregated by subtracting the total number of positive words from the total number of negative words per business. 
+
+While all three lexicons have more negative than positive words, the overall review sentiment for all three is positive.
+
+*What are the most common positive and negative terms for the 3 lexicons?*
+```{r, message=FALSE}
+#word counts afinn
+afinn_count <- tidy_reviews_kids %>% 
+  inner_join(afinn_lexicon) %>% 
+  count(word, value, sort=T) %>% 
+  ungroup
+
+afinn_count
+
+#word counts afinn positive
+tidy_reviews_kids %>% 
+  inner_join(afinn_lexicon) %>% 
+  count(word, value, sort=T) %>% 
+  filter(value > 0) %>% 
+  ungroup
+
+#word counts afinn negative
+tidy_reviews_kids %>% 
+  inner_join(afinn_lexicon) %>% 
+  count(word, value, sort=T) %>% 
+  filter(value<0) %>% 
+  ungroup
+
+
+```
+
+```{r, message=FALSE}
+#word counts nrc
+nrc_count <- tidy_reviews_kids %>% 
+  inner_join(nrc_lexicon) %>%
+  filter(sentiment=="negative"|sentiment=="positive") %>% 
+  count(word, sentiment, sort=T) %>% 
+  ungroup
+
+nrc_count
+
+#word counts nrc - positive
+tidy_reviews_kids %>% 
+  inner_join(nrc_lexicon) %>% 
+  filter(sentiment=="negative"|sentiment=="positive") %>% 
+  count(word, sentiment, sort=T) %>% 
+  filter(sentiment=="positive") %>% 
+  ungroup
+
+#word counts nrc
+tidy_reviews_kids %>% 
+  inner_join(nrc_lexicon) %>% 
+  filter(sentiment=="negative"|sentiment=="positive") %>% 
+  count(word, sentiment, sort=T) %>% 
+  filter(sentiment=="negative") %>% 
+  ungroup
+
+```
+
+```{r, message=FALSE}
+#word counts bing
+bing_count <- tidy_reviews_kids %>% 
+  inner_join(bing_lexicon) %>% 
+  count(word, sentiment, sort=T) %>% 
+  ungroup
+
+bing_count
+
+#word counts bing - positive
+tidy_reviews_kids %>% 
+  inner_join(bing_lexicon) %>% 
+  count(word, sentiment, sort=T) %>% 
+  filter(sentiment=="positive") %>% 
+  ungroup
+
+#word counts bing
+tidy_reviews_kids %>% 
+  inner_join(bing_lexicon) %>% 
+  count(word, sentiment, sort=T) %>% 
+  filter(sentiment=="negative") %>% 
+  ungroup
+
+```
+
+*Is the overall review sentiment for businesses consistent across the 3 sentiment lexicons?*  
+```{r}
+#comparison of the three lexicons
+sentiment_by_word <- bind_rows(nrc, bing) %>% 
+  select(-c(negative, positive)) %>% 
+  bind_rows(afinn)
+
+#count of negative scores per method
+sentiment_by_word %>% mutate(negative = ifelse(sentiment<0,"True","False")) %>% group_by(method) %>% count(negative)
+```
+
+NRC's lexicon rated the reviews as least negative. Afinn had more negative ratings and Bing had the most negative ratings.
+
+```{r}
+sentiment_by_word$method <- as.factor(sentiment_by_word$method)
+
+kruskal.test(sentiment~method, data = sentiment_by_word)
+posthoc.kruskal.nemenyi.test(sentiment~method, data = sentiment_by_word)
+```
+
+There is a significant difference between the three lexicons in the overall sentiment. Post-hoc tests indicate that each of the lexicons differs significantly from the others.  
+
+*Is there a relationship between a restaurant's star rating and the review sentiment?*
+```{r, message=FALSE}
+#relationship between stars and word level sentiment (grouped by lexicon)
+sentiment_by_word <- left_join(sentiment_by_word, (reviews_kids %>% select(ID, stars) %>% distinct(ID, .keep_all = T)) )
+
+sentiment_by_word %>% 
+  ggplot(aes(x = factor(stars), y = sentiment, fill=factor(method)))+
+  geom_boxplot()+
+  xlab("Stars")+
+  ylab("Sentiment Score")+
+  guides(fill=guide_legend(title="Lexicon"))
+```
+
+There is a linear upward trend that as the number of stars increases the sentiment rating is more positive. The relationship is strongest for the Bing lexicon and weakest for the NRC. But for all three methods the strength of association is weak (<0.25). 
+
+*What is the relationship between stars and word level sentiment?* 
+```{r, message=FALSE}
+#relationship between stars and word level sentiment (using bing)
+bing_stars <- sentiment_by_word %>% filter(method=="Bing") %>% left_join(reviews_sample[,c(1,5)])
+cor.test(bing_stars$sentiment, bing_stars$stars, method = "spearman")
+
+nrc_stars <- sentiment_by_word %>% filter(method=="NRC") %>% left_join(reviews_sample[,c(1,5)])
+cor.test(nrc_stars$sentiment, nrc_stars$stars, method = "spearman")
+
+afinn_stars <- sentiment_by_word %>% filter(method=="AFINN") %>% left_join(reviews_sample[,c(1,5)])
+cor.test(afinn_stars$sentiment, afinn_stars$stars, method = "spearman")
+
+
+```
+
+The Bing lexicon is used for subsequent analysis as it had the strongest correlation. I looked more closely at the Bing lexicon for variation in sentiment by number of stars.
+
+```{r, message=FALSE}
+kruskal.test(sentiment~stars, data = bing_stars)#testing is sentiment varies by number of stars for Bing
+posthoc.kruskal.nemenyi.test(sentiment~stars, data = bing_stars)
+
+#confirm that these differences also hold for the categories used in association analysis (<=3.5 and >=4)
+bing_cat <- bing_stars %>% select(-stars) %>% left_join(ff_assoc_trim[,1:2])
+
+kruskal.test(sentiment~stars, data = bing_cat)#testing is sentiment varies by number of stars for Bing
+posthoc.kruskal.nemenyi.test(sentiment~stars, data = bing_cat)
+```
+
+The sentiment rating varies between all star ratings.
+
+```{r, message=FALSE}
+library(wordcloud)
+library(reshape2)
+
+n_star <- c("3.5 orless","4 or more") 
+
+lapply(n_star, function(x){tidy_reviews_kids %>% 
+  select(-stars) %>% 
+  left_join(bing_lexicon) %>% 
+  left_join(ff_assoc_trim[,1:2]) %>% 
+  count(stars, word, sentiment, sort =T) %>%
+  filter(stars==x) %>% 
+  filter(!is.na(sentiment)) %>% 
+  acast(word~sentiment, value.var="n", fill=0) %>% 
+  comparison.cloud(colors=c("dodgerblue4", "orange2"), match.colors = T, title.bg.colors = "snow", max.words=50)})
+
+```
+
+The type of negative words varies by stars. At the lower star ratings, words like "rude", "nasty", and "horrible" appear in the reviews. At higher star ratings, words like "disappoint, "unfortunate" and "miss" appear.  
+
+For the positive words, at the lower star rating, words like "like", "work", and "smile" appear. At the  higher star ratings, "love", "great" and "friendly" appear. 
+
+# Create a restaurant classification model
+Create a model to classify restaurants using the attributes identified through the association rules analysis and the aggregated review sentiment ratings. 
+
+Create a dataframe with the required attributes
+-->stars (converted to 4 or more, 3.5 or less)
+-->parking on the street
+-->noise = 2
+-->ambience.casual
+-->sentiment
+```{r, message=FALSE}
+stars_df <- sentiment_by_word %>% filter(method=="Bing") %>% select(-c(stars)) %>% 
+  ungroup() %>% 
+  left_join(ff_assoc_trim[,c(1,2,3,6,9, 12, 13, 15, 19, 23, 33)], by = "ID") %>% 
+  select(-c(ID, method))
+
+stars_df
+```
+
+Check the data for completeness
+```{r}
+sum(complete.cases(stars_df))
+```
+
+Check the pattern of missing values
+```{r}
+md.pattern(stars_df, rotate.names = T)
+```
+
+Impute missing values using k-nearest neighbours
+```{r}
+stars_imputed <- kNN(stars_df, variable= c("Ambience.casual", "NoiseLevel", "HasTV", "BikeParking", "Ambience.classy", "Ambience.hipster", "Ambience.trendy", "BusinessParking.street", "Alcoholfull_bar"), k=5)
+
+
+stars_imputed <- stars_imputed %>% select(-ends_with("_imp"))
+
+#compare the attributes before and after imputation
+summary(stars_df) 
+summary(stars_imputed)
+```
+
+*Create a Logistic Regression model to classify restaurants*
+assumptions - 
+1) linearity - check the sentiment variable as it is continuous
+```{r}
+library(car)
+s100 <- stars_imputed$sentiment+100
+
+lreg <- glm(stars_imputed$stars~s100, family=binomial(link = "logit"))
+logodds <- lreg$linear.predictors
+boxTidwell(logodds~s100, data = stars_imputed)
+
+plot(logodds~s100)
+
+```
+There is a linear relationship between the logit of the dependent variable and the continuous, independent variable (sentiment). Note: sentiment was transformed by adding 100 to all values for this test, as the box tidewell test must be done with positive numbers.
+
+2) multicolinearity - check with a correlation matrix
+```{r}
+S <- stars_imputed[,-c(1,2)] 
+#features in binary format (0=absent; 1=present)
+S[1:ncol(S)] <- lapply(S[1:ncol(S)], as.character) #convert factors to characters
+S$NoiseLevel <- gsub("'","",S$NoiseLevel)
+S[1:ncol(S)] <- lapply(S[1:ncol(S)], as.numeric) #then convert to numeric (as you can't convert values directly from factor to numeric)
+S <-cbind(stars_imputed[,1],S)
+
+names(S) <- c("star", "bikP","nois","TV","cas","clas","hip","trnd","strP","bar")
+
+M <- cor(S, method = "spearman", use = "pairwise.complete.obs")
+corrplot.mixed(M, lower.col = "black", number.cex = .7)
+```
+None of the independent variables are highly correlated with one another.
+
+
+Partition the data
+```{r}
+set.seed(3939)
+train_index <- createDataPartition(stars_imputed$stars, p=0.75, list=F)
+stars_train <- stars_imputed[train_index,]
+stars_test <- stars_imputed[-train_index,]
+```
+
+Train a logistic regression model
+```{r}
+#train the model using 10-fold cross validation
+stars_lr_model <- train(form = stars~., data = stars_train, trControl = trainControl(method = "cv", number=10), method = "glm", family= "binomial")
+
+stars_lr_model #view the model and check performance of cross-validation accuracy
+
+stars_lr_model$finalModel #view the final model weights, etc.
+summary(stars_lr_model)
+exp(stars_lr_model$finalModel$coefficients)
+
+```
+
+Make predictions
+```{r}
+stars_lr_predict <- predict(stars_lr_model, newdata = stars_test) #use the model to predict star ratings for test data
+
+confusionMatrix(stars_lr_predict, stars_test$stars, positive = "4 or more") #create a confusion matrix
+
+exp(summary(stars_lr_model)$coefficients[,1])#exponentiate the coefficients and interpret as  odds ratios
+```
+
+```{r}
+lr_ROC <- rocit(score = as.numeric(stars_lr_predict), class=as.numeric(stars_test$stars))
+
+plot(lr_ROC, legend=F)
+```
+
+
+*Create a C5.0 Decision Tree model*
+Train the model
+```{r, message=FALSE, warning=FALSE}
+stars_tree_model <- train(stars~., data = stars_train, method = "C5.0",trControl = trainControl(method = 'cv', number=10), tuneGrid=expand.grid(trials = c(1, 2, 3), 
+model = c("tree"), winnow = c(FALSE, FALSE, FALSE)))
+
+stars_tree_model
+```
+
+
+Make Predictions 
+```{r}
+stars_tree_predict <- predict(stars_tree_model, newdata = stars_test) #use the model to predict star ratings for test data
+
+confusionMatrix(stars_tree_predict, stars_test$stars, positive = "4 or more") #create a confusion matrix
+```
+
+```{r}
+library(C50) #use the C50 package to produce a decision tree visual
+c5_model <- C50::C5.0.default(x=stars_train[,-2], y=stars_train$stars, trials = 1, rules = F, control =C5.0Control(winnow=stars_tree_model$bestTune$winnow, minCases = 100))
+
+plot(c5_model, gp = gpar(fontsize=10, fontface = "bold"))
+```
+
+
+
+Make Predictions - version2
+```{r}
+c5_predict <- predict(c5_model, newdata = stars_test) #use the model to predict star ratings for test data
+
+confusionMatrix(c5_predict, stars_test$stars, positive = "4 or more") #create a confusion matrix
+```
+
+```{r}
+dt_ROC <- rocit(score = as.numeric(stars_tree_predict), class=as.numeric(stars_test$stars))
+
+plot(dt_ROC, legend=F)
+```
+
+Compare the two models 
+
+```{r}
+accuracy_lr <- stars_lr_model$resample %>% arrange(Resample) %>% rename(LR = Accuracy) %>% select(c(1)) #accuracy of the 10 cross folds for LR
+accuracy_dt <- stars_tree_model$resample %>% arrange(Resample) %>% rename(DT = Accuracy) %>% select(c(1))#accuracy of the 10 cross folds for DR
+accuracy_df <- cbind(accuracy_lr,accuracy_dt) #dataframe combining the accuracy of training values of both models
+accuracy_df
+```
+Comparison of the two models using wilcoxon rank sum test.  A non-parametric test was used because the accuracy of the folds for both models was right skewed or flat.
+```{r}
+hist(accuracy_lr$LR)
+hist(accuracy_dt$DT)
+
+
+wilcox.test(accuracy_df$LR, accuracy_df$DT, paired = F)
+
+```
